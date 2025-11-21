@@ -1,0 +1,1 @@
+# WP-FPM-Nginx-Redis-PMA-coolify-
