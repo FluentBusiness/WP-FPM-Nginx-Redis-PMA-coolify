@@ -17,6 +17,7 @@ NC='\033[0m' # No Color
 
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 ask_yes_no() {
     local prompt="$1"
@@ -30,19 +31,24 @@ ask_yes_no() {
     done
 }
 
-# --- 1. ОБНОВЛЕНИЕ ---
+# --- 1. ОБНОВЛЕНИЕ СИСТЕМЫ ---
 update_system() {
-    info "Обновление пакетов..."
+    info "Обновление пакетов и установка зависимостей..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get -qqy update
     apt-get -qqy -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade
     apt-get -y autoremove
-    # Установка утилиты для конвертации ключей
-    apt-get install -y putty-tools
-    info "Система обновлена."
+    
+    # Установка утилит:
+    # putty-tools - для конвертации ключей
+    # jq, git, curl, wget - нужны для работы многих скриптов и Coolify
+    # htop - для мониторинга ресурсов
+    apt-get install -y putty-tools curl wget jq git htop
+    
+    info "Система обновлена и базовые утилиты установлены."
 }
 
-# --- 2. НАСТРОЙКА SWAP (Новая функция) ---
+# --- 2. НАСТРОЙКА SWAP (4GB) ---
 configure_swap() {
     info "--- ПРОВЕРКА SWAP ---"
     
@@ -52,19 +58,20 @@ configure_swap() {
     elif [ -f /swapfile ]; then
         warn "Файл /swapfile существует, но не активен. Пропуск во избежание конфликтов."
     else
-        info "Создание Swap-файла размером 2GB..."
-        fallocate -l 2G /swapfile
+        # OnlyOffice требователен к памяти, ставим 4GB для надежности
+        info "Создание Swap-файла размером 4GB..."
+        fallocate -l 4G /swapfile
         chmod 600 /swapfile
         mkswap /swapfile
         swapon /swapfile
         
-        # Добавляем в fstab для автозагрузки, если там еще нет записи
+        # Добавляем в fstab для автозагрузки
         if ! grep -q "/swapfile" /etc/fstab; then
             echo '/swapfile none swap sw 0 0' >> /etc/fstab
             info "Swap добавлен в автозагрузку."
         fi
         
-        info "✅ Swap (2GB) успешно создан и подключен."
+        info "✅ Swap (4GB) успешно создан и подключен."
     fi
 }
 
@@ -85,17 +92,20 @@ generate_keys() {
     mkdir -p /root/.ssh
     chmod 700 /root/.ssh
     
+    # Добавляем публичный ключ в authorized_keys
     if ! grep -qf "${KEY_PATH}.pub" /root/.ssh/authorized_keys 2>/dev/null; then
         cat "${KEY_PATH}.pub" >> /root/.ssh/authorized_keys
         info "Ключ добавлен в authorized_keys."
     fi
     chmod 600 /root/.ssh/authorized_keys
     
+    # Сохраняем ключи в переменные перед удалением
     PRIVATE_KEY_OPENSSH=$(cat "$KEY_PATH")
     PRIVATE_KEY_PPK=$(cat "${KEY_PATH}.ppk")
     
-    # Удаляем ключи с диска
+    # Удаляем ключи с диска (для безопасности)
     rm -f "$KEY_PATH" "${KEY_PATH}.ppk" "${KEY_PATH}.pub"
+    info "Временные файлы ключей удалены с диска."
 }
 
 # --- 4. ФАЕРВОЛ ---
@@ -127,12 +137,13 @@ harden_ssh() {
     SSHD_CONFIG="/etc/ssh/sshd_config"
     cp $SSHD_CONFIG "${SSHD_CONFIG}.bak"
 
+    # Разрешаем root только по ключам, отключаем пароли
     sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "$SSHD_CONFIG"
     sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' "$SSHD_CONFIG"
     sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' "$SSHD_CONFIG"
     sed -i 's/^#\?ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/' "$SSHD_CONFIG"
-    sed -i 's/^#\?UsePAM .*/UsePAM no/' "$SSHD_CONFIG"
-
+    # UsePAM оставляем (или yes), полное отключение может ломать сессии на некоторых OS
+    
     systemctl restart ssh
     info "✅ SSH настроен: Root разрешен (только ключи), пароли отключены."
 }
@@ -153,7 +164,10 @@ install_docker() {
 # --- 7. FAIL2BAN ---
 install_fail2ban() {
     info "--- FAIL2BAN ---"
-    apt-get install -y fail2ban
+    if ! command -v fail2ban-client &> /dev/null; then
+        apt-get install -y fail2ban
+    fi
+    
     cat <<EOF > /etc/fail2ban/jail.local
 [sshd]
 enabled = true
@@ -169,11 +183,15 @@ EOF
 }
 
 # --- ЗАПУСК ---
-ask_yes_no "Начать настройку сервера (Root, Keys, UFW, Swap, Docker)?"
+echo ""
+echo "Этот скрипт подготовит сервер для Coolify/Docker."
+echo "Будет настроен: Swap (4GB), Docker, UFW, SSH (Key-only), Fail2ban."
+echo ""
+ask_yes_no "Начать настройку?"
 if [[ "$CONFIRM" == "n" ]]; then exit 0; fi
 
 update_system
-configure_swap    # <--- Добавлен запуск Swap
+configure_swap
 generate_keys
 setup_firewall
 install_docker
@@ -190,20 +208,23 @@ echo ""
 echo "IP сервера: $(curl -s4 https://ifconfig.me)"
 echo "Пользователь: root"
 echo "Порт SSH: 22"
-echo "Swap: Активен (2GB)"
+echo "Swap: Активен (4GB)"
+echo "Docker: $(docker --version)"
 echo ""
 echo -e "${YELLOW}!!! СКОПИРУЙТЕ КЛЮЧИ ПРЯМО СЕЙЧАС !!!${NC}"
-echo "Ключи удалены с диска. Если вы закроете окно без сохранения,"
-echo "доступ к серверу будет потерян навсегда."
+echo "Ключи УДАЛЕНЫ с диска сервера. Вы видите их в последний раз."
+echo "Если вы закроете терминал без сохранения, доступ будет утерян."
 echo ""
 echo "----------------------------------------------------------"
-echo "PRIVATE KEY (OpenSSH) - Для Coolify / Linux / Mac:"
+echo "PRIVATE KEY (OpenSSH) - Вставьте этот ключ в Coolify:"
 echo "----------------------------------------------------------"
 echo "$PRIVATE_KEY_OPENSSH"
 echo ""
 echo "----------------------------------------------------------"
-echo "PRIVATE KEY (PuTTY .ppk) - Для Windows:"
+echo "PRIVATE KEY (PuTTY .ppk) - Если нужен доступ через Windows:"
 echo "----------------------------------------------------------"
 echo "$PRIVATE_KEY_PPK"
 echo "----------------------------------------------------------"
+echo ""
+echo -e "${GREEN}Готово. Теперь добавьте этот сервер в Coolify, используя OpenSSH ключ.${NC}"
 echo ""
